@@ -5,6 +5,8 @@ Sends your ECS task logs to Amazon S3. When the tasks stop, a Cloudwatch Event s
 
 It can create a bucket but you may also specify an existing one as parameter.
 
+![template](template.png)
+
 ## Why
 1. Because browsing Clouwatch Logs sucks.
 2. Leverage useful S3 features: long term storage, archival, encryption, etc.
