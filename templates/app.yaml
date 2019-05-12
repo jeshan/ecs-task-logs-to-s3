@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'send ecs task (EC2 and Fargate) cloudwatch logs to S3'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  ExistingBucket:
+    Type: String
+    Description: target bucket where to send the logs. leave blank to create a new one
+    Default: ''
+
+Conditions:
+  isCreateBucket: !Equals ['', !Ref ExistingBucket]
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Condition: isCreateBucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - ExpirationInDays: 90
+            Prefix: exportedLogs
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 60
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: isCreateBucket
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Sid: logs-to-s3-read
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !If [isCreateBucket, !Sub 'arn:aws:s3:::${Bucket}', !Sub 'arn:aws:s3:::${ExistingBucket}']
+          - Sid: logs-to-s3-write
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+            Action: s3:PutObject
+            Resource: !If [isCreateBucket, !Sub 'arn:aws:s3:::${Bucket}/*', !Sub 'arn:aws:s3:::${ExistingBucket}/*']
+
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: |
+        import boto3
+        import os
+        from time import sleep, time
+
+        logs = boto3.client('logs')
+        ecs = boto3.client('ecs')
+
+        def handler(event, context):
+          print('event = ', event)
+          detail = event['detail']
+          if detail['lastStatus'] != 'STOPPED':
+            return
+          definition = ecs.describe_task_definition(taskDefinition=detail['taskDefinitionArn'])['taskDefinition']
+          log_suffix = detail['taskArn'][detail['taskArn'].rindex('/'):]
+
+          for container in definition['containerDefinitions']:
+            log_config = container['logConfiguration']
+            if log_config['logDriver'] != 'awslogs':
+              continue
+            group = log_config['options']['awslogs-group']
+            region = log_config['options'].get('awslogs-region', os.environ['AWS_DEFAULT_REGION'])
+            prefix = log_config['options'].get('awslogs-stream-prefix')
+
+            stream_prefix = container['name']
+            if prefix:
+              stream_prefix += f'/{prefix}'
+            stream_prefix += log_suffix
+
+            destination_prefix = f'exportedLogs{log_suffix}'
+            to_time = int(time() * 1000)
+
+            response = logs.create_export_task(logGroupName=group, logStreamNamePrefix=stream_prefix, fromTime=0,
+              to=to_time, destination=os.environ['BucketName'], destinationPrefix=destination_prefix)
+
+            while True:
+              export_tasks = logs.describe_export_tasks(taskId=response['taskId'])['exportTasks']
+              if len(export_tasks):
+                task = export_tasks[0]
+                if task['status']['code'] in ['CANCELLED', 'COMPLETED', 'FAILED']:
+                  print('Task finished with state', task['status']['code'])
+                  break
+              print('Waiting 3 seconds')
+              sleep(3)
+      Handler: index.handler
+      Runtime: python3.7
+      MemorySize: 128
+      Timeout: 300
+      Policies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ecs:DescribeTaskDefinition
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - logs:CreateExportTask
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+          - Effect: Allow
+            Action:
+              - logs:DescribeExportTasks
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group::log-stream:'
+      Environment:
+        Variables:
+          BucketName: !If [isCreateBucket, !Ref Bucket, !Ref ExistingBucket]
+      Events:
+        Cw:
+          Type: CloudWatchEvent
+          Properties:
+            Pattern:
+              source:
+                - aws.ecs
+              detail-type:
+                - ECS Task State Change
+
+Outputs:
+  Bucket:
+    Value: !Ref Bucket
