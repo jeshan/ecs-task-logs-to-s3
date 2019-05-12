@@ -1,0 +1,4 @@
+template_path: template.yaml
+project_code: ecs-task-logs-to-s3
+
+region: us-east-1
