@@ -133,5 +133,5 @@ Resources:
                 - ECS Task State Change
 
 Outputs:
-  Bucket:
+  LogsBucket:
     Value: !Ref Bucket
